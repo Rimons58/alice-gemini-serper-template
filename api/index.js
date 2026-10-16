@@ -2,9 +2,11 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
+const MAX_SESSION_STATE_BYTES = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const SERPER_TIMEOUT_MS = 800;
+const GEMINI_TIMEOUT_MS = 3000;
+const RESPONSE_RESERVE_MS = 400;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -21,8 +23,34 @@ function aliceResponse(text, endSession = false, history = []) {
       text: fitAliceText(text),
       end_session: endSession
     },
-    session_state: { history }
+    session_state: fitSessionState(history)
   };
+}
+
+function fitSessionState(history) {
+  const messages = safeHistory(history);
+  const size = items => Buffer.byteLength(JSON.stringify({ history: items }), "utf8");
+
+  // Alice limits the whole session_state object to 1 KiB, including UTF-8 text.
+  // Prefer the newest exchange; trim individual messages only if it cannot fit.
+  while (messages.length > 2 && size(messages) > MAX_SESSION_STATE_BYTES) {
+    messages.splice(0, Math.min(2, messages.length - 2));
+  }
+  if (size(messages) <= MAX_SESSION_STATE_BYTES) return { history: messages };
+
+  const texts = messages.map(item => Array.from(item.text));
+  let low = 0;
+  let high = Math.max(...texts.map(text => text.length));
+  const capped = length => messages.map((item, i) => ({
+    role: item.role,
+    text: texts[i].slice(0, length).join("")
+  }));
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (size(capped(middle)) <= MAX_SESSION_STATE_BYTES) low = middle;
+    else high = middle - 1;
+  }
+  return { history: capped(low) };
 }
 
 function fitAliceText(value) {
@@ -46,7 +74,12 @@ function fitAliceText(value) {
 }
 
 function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные|(?:список|перечень|состав)\s+(?:всех\s+)?подразделени|(?:список|перечень).*(?:на\s+(?:сервере|сайте)|проекта|компании)/i.test(text);
+}
+
+function isTimeoutError(error) {
+  return error?.name === "AbortError" || error?.name === "TimeoutError" ||
+    error?.message === "AbortError" || error?.message === "TIME_BUDGET_EXHAUSTED";
 }
 
 function safeHistory(history) {
@@ -62,8 +95,17 @@ async function fetchJson(url, options, timeoutMs) {
   const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
-    const data = await response.json().catch(() => ({}));
+    const data = await response.json().catch(error => {
+      if (controller.signal.aborted || isTimeoutError(error)) throw error;
+      return {};
+    });
+    if (controller.signal.aborted) throw new Error("TIME_BUDGET_EXHAUSTED");
     return { response, data };
+  } catch (error) {
+    if (controller.signal.aborted || isTimeoutError(error)) {
+      throw new Error("TIME_BUDGET_EXHAUSTED");
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -105,7 +147,7 @@ async function searchWeb(query, timeoutMs) {
     if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
+    console.warn("Serper search unavailable:", isTimeoutError(error) ? "TIME_BUDGET_EXHAUSTED" : "REQUEST_FAILED");
     return "";
   }
 }
@@ -182,6 +224,10 @@ function errorForUser(error) {
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "SEARCH_NOT_CONFIGURED":
+      return "Поиск в интернете пока не настроен. Я могу ответить на общий вопрос, но не проверить актуальные сведения.";
+    case "SEARCH_UNAVAILABLE":
+      return "Не удалось получить результаты поиска. Попробуйте повторить вопрос чуть позже.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
@@ -220,16 +266,18 @@ export default async function handler(req, res) {
 
   try {
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
+    if (isSearchIntent(text)) {
+      if (!process.env.SERPER_API_KEY) throw new Error("SEARCH_NOT_CONFIGURED");
+      // Leave a generation budget within Alice's 4.5-second network deadline.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      if (!searchContext) throw new Error("SEARCH_UNAVAILABLE");
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - RESPONSE_RESERVE_MS))
     );
 
     const history = [
@@ -238,10 +286,11 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
+    console.info("Alice request completed:", { durationMs: Date.now() - startedAt });
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
+    const safeError = isTimeoutError(error) ? new Error("TIME_BUDGET_EXHAUSTED") : error;
+    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error", { durationMs: Date.now() - startedAt });
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
